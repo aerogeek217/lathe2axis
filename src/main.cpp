@@ -8,49 +8,48 @@
 
 /////////////////
 // SETTINGS
+#define verbose true                     // Debug output to Serial
+
 #define jogBase_mm 1.0                    // X jog increment for each press of the button
 #define jogFeed_mmSec 4.0                 // X jog feed rate
-#define spindleIncr_Turns 0.5             // Spindle increment for each command
+#define spindleIncr_ms 400                // Time to run spindle for each command. Should be long enough to execute all other functions between sends, and longer than the interval between status requests.
 #define spindleMaxSpeed_TurnsSec 5.0
 
-#define verbose false                     // Debug output to Serial
-
-/////////////////
-
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels 
-#define I2C_ADDRESS 0x3C
- 
-// Buttons
+// Pin assignments
+#define grblRxPin 2
+#define grblTxPin 3
 #define startPin 5
 #define stopPin 4
 #define modePin 6 // TODO: set mode enum
 #define zeroPin 7
-
+#define jogNegPin 8
 #define jogPosPin 9
+#define dirPin 10
+#define jog01Pin 12 // 0.1 mm/sec
+#define jog10Pin 11 // 10 mm/sec
+int speedPin = A1;
+
+/////////////////
+
 bool jogPosVal = false;
 bool jogPosValPrev = false;
 bool joggingPos = false;
-
-#define jogNegPin 8
 bool jogNegVal = false;
 bool jogNegValPrev = false;
 bool joggingNeg = false;
-
-#define dirPin 10
 bool dirVal = false;
-
-#define jog01Pin 12 // 0.1 mm/sec
-#define jog10Pin 11 // 10 mm/sec
+bool initLathe = true;
 double jog_mm = jogBase_mm;
-
-int speedPin = A1;
-double speedVal = 0; // Turns per sec
-
+double spindleSpeed_TurnsSec = 0;
 bool running = false;
-
 unsigned long lastDisplay = millis();
 unsigned long lastStatusReq = millis();
+double spindleIncr_Turns = 0;
+double spindleIncrNew_Turns = 0;
+double spindleCmd_Turns = 0;
+double spindleCur_Turns = 0;
+double xCmd_mm = 0;
+double xCur_mm = 0;
 
 enum modes {
   lathe,
@@ -58,15 +57,12 @@ enum modes {
 };
 modes mode = lathe;
 
-// G Code
-#define GRBL_BUFFER_SIZE 64//128
+// G Code and GRBL
+#define GRBL_BUFFER_SIZE 128
 #define STRLEN 64
 #define maxCommands 5
+SoftwareSerial grblSerial(grblRxPin, grblTxPin);
 int charCount = 0; // Bytes sent to GRBL
-int iNextCommand = 0; // Index of next command to send to GRBL
-int pendCommands = 0; // Number of commands pending to be sent
-char commandQ[maxCommands][STRLEN]; // Queue of gcode to send to GRBL
-char nextCommand[STRLEN];
 char gCodeStr[STRLEN];
 
 // Status
@@ -76,76 +72,32 @@ char speedStr[STRLEN];
 char posStr[STRLEN];
 char tempStr[STRLEN];
 
-// Commanbded and current positions
-double spindleCmd_Turns = 0;
-double spindleCur_Turns = 0;
-double xCmd_mm = 0;
-double xCur_mm = 0;
-
-// Talking to GRBL over software serial
-#define grblRxPin 2
-#define grblTxPin 3
-SoftwareSerial grblSerial(grblRxPin, grblTxPin);
-
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-#define OLED_RESET     -1//4 // Reset pin # (or -1 if sharing Arduino reset pin)
 SSD1306AsciiAvrI2c display;
-//Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-bool AppendGCode(const char* gCode)
+#define I2C_ADDRESS 0x3C
+ 
+bool SendGCode(const char* gCode)
 {
-  // No room for a new command
-  if (pendCommands >= maxCommands) return false;
+  // Send command if GRBL buffer is not full
+  int len = strlen(gCode);
 
-  // Add command to internal buffer
-  strcpy(commandQ[(iNextCommand + pendCommands) % maxCommands], gCode);
-  pendCommands++;
-//  if (verbose) Serial.println(gCode);
-
-  return true;
-}
-
-void SendGCode()
-{
-  // Send commands until GRBL buffer is full
-  while (pendCommands > 0)
+  if (charCount + len <= GRBL_BUFFER_SIZE-1 ) // && grblSerial.available() == 0
   {
-    strcpy(nextCommand, commandQ[iNextCommand]);
-    int len = strlen(nextCommand);
+    grblSerial.write(gCode);
+    grblSerial.write('\n');
+    charCount += len + 1;
+    grblSerial.flush();
 
-    if (charCount + len <= GRBL_BUFFER_SIZE-1 && grblSerial.available() == 0)
-    {
-      grblSerial.write(nextCommand);
-      grblSerial.write('\n');
-      charCount += len + 1;
-      if (verbose) Serial.println(nextCommand);
+    if (verbose) Serial.println(gCode);
 
-      pendCommands--;
-      iNextCommand++;
-
-      if (iNextCommand == maxCommands) iNextCommand = 0;
-    }
-    else
-    {
-      break;
-    } 
+    return true;
   }
 
-  // Request status
-  unsigned long curTime = millis();
-  if ((curTime - lastStatusReq) > 500 && grblSerial.available() == 0)
-  {
-    grblSerial.write("?");
-    lastStatusReq = curTime;
-  }
-
-  grblSerial.flush();
+  return false;
 }
 
 void RecvResp()
 {
-  delay(50); // Necessary to prevent corruption in SoftwareSerial for some reason
- 
   while (grblSerial.available() > 0)
   {
     char recvChar = grblSerial.read();
@@ -186,7 +138,7 @@ void RecvResp()
         display.setRow(0);
         display.println(""); display.println(""); display.println("");
         display.clearToEOL();
-        display.println(errorStr);
+        display.println(errorStr); 
       }
       if (verbose) Serial.println(respStr);
       strcpy(respStr, "");
@@ -234,10 +186,13 @@ void setup()
   InitDisplay();
 
   // Initialize GRBL
-  AppendGCode("G91");
-  AppendGCode("G10 L20 P1 Y0"); // Reset spindle work position
+  SendGCode("G91");
+  SendGCode("G10 L20 P1 Y0"); // Reset spindle work position
+  grblSerial.write("~"); // Return to IDLE state
 
   strcpy(respStr, "");
+
+  if (verbose) Serial.println("Initialized");
 }
 
 void GetInputs()
@@ -269,7 +224,12 @@ void GetInputs()
   
   if (!digitalRead(stopPin))
   { 
-    if (verbose && running) Serial.println("Stop");
+    if (running)
+    {
+      grblSerial.write("!"); // Cancel any existing movements
+      grblSerial.write("~"); // Return to IDLE state
+      if (verbose) Serial.println("Stop");
+    }
     running = false;
     display.setRow(0);
     display.clearToEOL();
@@ -277,17 +237,20 @@ void GetInputs()
   }
   else if (!digitalRead(startPin)) 
   {
-    if (verbose && !running) Serial.println("Run");
+    if (!running)
+    {
+      if (verbose) Serial.println("Run");
+    }
     running = true;
     display.setRow(0);
     display.clearToEOL();
     display.println("Running");
   }
   
-  speedVal = float(analogRead(speedPin)) * (spindleMaxSpeed_TurnsSec-1.0) / 1024.0 + 1.0/1024.0; // Min 1 turn per second
+  spindleSpeed_TurnsSec = float(analogRead(speedPin)) * (spindleMaxSpeed_TurnsSec-1.0) / 1024.0 + 1.0/1024.0; // Min 1 turn per second
 
   if (!digitalRead(zeroPin))
-  AppendGCode("G10 L20 P1 X0 Y0"); // Reset  work position
+  SendGCode("G10 L20 P1 X0 Y0"); // Reset  work position
 }
 
 void UpdateDisplay()
@@ -297,50 +260,53 @@ void UpdateDisplay()
   lastDisplay = curTime;
 
   display.setRow(0);
-  //display.setRow(1);
   display.println("");
-  sprintf(speedStr,"%2.0f RPM",speedVal * 60.0);
+  sprintf(speedStr,"%2.0f RPM",spindleSpeed_TurnsSec * 60.0);
   display.println(speedStr);
 
-  //display.setRow(2);
   sprintf(posStr,"%4.1fmm %6.0f t",xCur_mm,spindleCur_Turns);
   display.println(posStr);
 }
 
 void JogX()
 {
-  // Add jogging command if there is room
+  // Add jogging command if there is room. Otherwise try again later.
   if (joggingPos)
   {
-    sprintf(gCodeStr, "G1 X%f F%f", jog_mm, jogFeed_mmSec * 60.0);
-    if (AppendGCode(gCodeStr)) joggingPos = false;
+    sprintf(gCodeStr, "$J=X%f F%f", jog_mm, jogFeed_mmSec * 60.0);
+    if (SendGCode(gCodeStr)) joggingPos = false;
   }
   else if (joggingNeg)
   {
-    sprintf(gCodeStr, "G1 X-%f F%f", jog_mm, jogFeed_mmSec * 60.0);
-    if (AppendGCode(gCodeStr)) joggingNeg = false;
+    sprintf(gCodeStr, "$J=X-%f F%f", jog_mm, jogFeed_mmSec * 60.0);
+    if (SendGCode(gCodeStr)) joggingNeg = false;
   }
 }
 
 void RunLathe()
 {
-  // Send another turn command if the queue is getting empty and we have few turns to go. Leave room for other commands.
-  // TODO: Base this on time, not number of turns
-  // TODO: Getting stuck at low RPM
-  if (pendCommands >= maxCommands-1 || fabs(spindleCmd_Turns - spindleCur_Turns) > spindleIncr_Turns * 5.0) return;
-
-Serial.println(dirVal);
-  if (dirVal) 
+  if (!running)
   {
-    sprintf(gCodeStr, "G1 Y%f F%f", spindleIncr_Turns, speedVal * 60.0);
-    spindleCmd_Turns += spindleIncr_Turns;
+    spindleCmd_Turns = spindleCur_Turns;
+    return;
+  }
+
+  if ((dirVal && ((spindleCmd_Turns - spindleCur_Turns) <= spindleIncr_Turns)) || (!dirVal && ((spindleCmd_Turns - spindleCur_Turns) >= spindleIncr_Turns)))
+  {
+    spindleIncrNew_Turns = spindleIncr_ms * spindleSpeed_TurnsSec / 1000.0;
+    if (!dirVal) spindleIncrNew_Turns *= -1.0;
+    sprintf(gCodeStr, "$J=Y%f F%f", spindleIncrNew_Turns, spindleSpeed_TurnsSec * 60.0);
+    if (SendGCode(gCodeStr))
+    {
+      spindleIncr_Turns = spindleIncrNew_Turns;
+      spindleCmd_Turns += spindleIncr_Turns;
+    }
+    //if (verbose) Serial.println("Lathe: Incr" + String(spindleIncr_Turns));
   }
   else
   {
-    sprintf(gCodeStr, "G1 Y-%f F%f", spindleIncr_Turns, speedVal * 60.0);
-    spindleCmd_Turns -= spindleIncr_Turns;
+    //if (verbose) Serial.println("Lathe: " + String(spindleCur_Turns) + ", waiting for " + String(spindleCmd_Turns));
   }
-  AppendGCode(gCodeStr);
 }
 
 void loop() 
@@ -351,14 +317,22 @@ void loop()
   switch (mode)
   {
     case lathe:
-      if (running) RunLathe();
+      RunLathe();
     break;
 
     case wind:
+      //TODO
     break;
   }
 
-  SendGCode();
+  // Request status
+  unsigned long curTime = millis();
+  if ((curTime - lastStatusReq) > 200 ) //&& grblSerial.available() == 0
+  {
+    grblSerial.write("?");
+    lastStatusReq = curTime;
+  }
+
   RecvResp();
   UpdateDisplay();
 }
