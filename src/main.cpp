@@ -1,3 +1,8 @@
+/* TODO:
+- Recv buffer freezing? (flush and/or check available)
+- Wind start at end vs start inconsistent
+*/
+
 #include <SoftwareSerial.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -11,16 +16,16 @@
 #define verbose true                     // Debug output to Serial
 
 #define jogBase_mm 1.0                    // X jog increment for each press of the button
-#define jogFeed_mmSec 4.0                 // X jog feed rate
-#define spindleIncr_ms 400                // Time to run spindle for each command. Should be long enough to execute all other functions between sends, and longer than the interval between status requests.
-#define spindleMaxSpeed_TurnsSec 5.0
+#define jogFeed_mmSec 5.0                 // X jog feed rate
+#define spindleIncr_ms 500                // Time to run spindle for each command (lathe mode). Should be long enough to execute all other functions between sends, and longer than the interval between status requests.
+#define spindleMaxSpeed_TurnsSec 8.0
 
 // Pin assignments
 #define grblRxPin 2
 #define grblTxPin 3
 #define startPin 5
 #define stopPin 4
-#define modePin 6 // TODO: set mode enum
+#define modePin 6
 #define zeroPin 7
 #define jogNegPin 8
 #define jogPosPin 9
@@ -38,7 +43,8 @@ bool jogNegVal = false;
 bool jogNegValPrev = false;
 bool joggingNeg = false;
 bool dirVal = false;
-bool initLathe = true;
+bool startVal = false;
+bool startValPrev = false;
 double jog_mm = jogBase_mm;
 double spindleSpeed_TurnsSec = 0;
 bool running = false;
@@ -50,17 +56,31 @@ double spindleCmd_Turns = 0;
 double spindleCur_Turns = 0;
 double xCmd_mm = 0;
 double xCur_mm = 0;
+double xIncr_mm = 0;
+double winderxMin_mm = 0;
+double winderxMax_mm = 0;
+double wireDia_mm = 0;
 
-enum modes {
+enum modes 
+{
   lathe,
   wind
 };
 modes mode = lathe;
+modes modePrev = mode;
+
+enum winderStages
+{
+  initEndX,
+  initStartX,
+  initDiameter,
+  winding
+};
+winderStages winderStage = initEndX;
 
 // G Code and GRBL
 #define GRBL_BUFFER_SIZE 128
-#define STRLEN 64
-#define maxCommands 5
+#define STRLEN 128
 SoftwareSerial grblSerial(grblRxPin, grblTxPin);
 int charCount = 0; // Bytes sent to GRBL
 char gCodeStr[STRLEN];
@@ -71,6 +91,7 @@ char respStr[STRLEN];
 char speedStr[STRLEN];
 char posStr[STRLEN];
 char tempStr[STRLEN];
+char statusStr[STRLEN];
 
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 SSD1306AsciiAvrI2c display;
@@ -81,7 +102,7 @@ bool SendGCode(const char* gCode)
   // Send command if GRBL buffer is not full
   int len = strlen(gCode);
 
-  if (charCount + len <= GRBL_BUFFER_SIZE-1 ) // && grblSerial.available() == 0
+  if (charCount + len <= GRBL_BUFFER_SIZE-1 && grblSerial.available() == 0)
   {
     grblSerial.write(gCode);
     grblSerial.write('\n');
@@ -195,9 +216,46 @@ void setup()
   if (verbose) Serial.println("Initialized");
 }
 
+void StartSpindle()
+{
+  if (!running)
+  {
+    if (verbose) Serial.println("Run");
+  }
+  running = true;
+
+  if (mode == lathe) sprintf(statusStr, "Lathe Running");
+  else sprintf(statusStr, "Winder Running");
+}
+
+void StopSpindle()
+{
+  if (running)
+  {
+    grblSerial.write("!"); // Cancel any existing movements
+    grblSerial.write("~"); // Return to IDLE state
+    if (verbose) Serial.println("Stop");
+  }
+  running = false;
+  spindleCmd_Turns = spindleCur_Turns;
+
+  if (mode == lathe) sprintf(statusStr, "Lathe Stopped");
+  else sprintf(statusStr, "Winder Stopped");
+}
+
 void GetInputs()
 {
   // Some commands latch true until they are able to be sent to GRBL
+
+  if (!digitalRead(modePin)) mode = lathe;
+  else mode = wind;
+
+  if (mode != modePrev)
+  {
+    StopSpindle();
+    winderStage = initEndX;
+  }
+  modePrev = mode;
 
   jogPosVal = !digitalRead(jogPosPin);
   joggingPos |= (jogPosVal && !jogPosValPrev);
@@ -222,31 +280,43 @@ void GetInputs()
   
   dirVal = digitalRead(dirPin);
   
-  if (!digitalRead(stopPin))
-  { 
-    if (running)
-    {
-      grblSerial.write("!"); // Cancel any existing movements
-      grblSerial.write("~"); // Return to IDLE state
-      if (verbose) Serial.println("Stop");
-    }
-    running = false;
-    display.setRow(0);
-    display.clearToEOL();
-    display.println("Stopped");
-  }
-  else if (!digitalRead(startPin)) 
+  startVal = !digitalRead(startPin);
+  if (startVal && !startValPrev)
   {
-    if (!running)
+    if (mode == wind)
     {
-      if (verbose) Serial.println("Run");
+      switch (winderStage)
+      {
+        case initEndX:
+          winderStage = initStartX;
+          break;
+
+        case initStartX:
+          winderStage = initDiameter;
+    
+          if (xIncr_mm == 0.0) sprintf(gCodeStr, "G10 L20 P1 X0 Y0"); // Reset  work position
+          else sprintf(gCodeStr, "G10 L20 P1 X%f Y0",winderxMax_mm-winderxMin_mm);
+          SendGCode(gCodeStr);
+          xCmd_mm = 0.0;
+
+          break;
+
+        case initDiameter:
+          winderStage = winding;
+          break;
+
+        case winding:
+          StartSpindle();
+          break;
+      } 
     }
-    running = true;
-    display.setRow(0);
-    display.clearToEOL();
-    display.println("Running");
+
+    else StartSpindle();
   }
-  
+  startValPrev = startVal;
+
+  if (!digitalRead(stopPin)) StopSpindle();
+
   spindleSpeed_TurnsSec = float(analogRead(speedPin)) * (spindleMaxSpeed_TurnsSec-1.0) / 1024.0 + 1.0/1024.0; // Min 1 turn per second
 
   if (!digitalRead(zeroPin))
@@ -256,11 +326,15 @@ void GetInputs()
 void UpdateDisplay()
 {
   unsigned long curTime = millis();
-  if ((curTime - lastDisplay) < 200) return;
+  if ((curTime - lastDisplay) < 500) return;
   lastDisplay = curTime;
 
+  display.clear();
+
   display.setRow(0);
-  display.println("");
+  display.println(statusStr);
+
+  display.setRow(2);
   sprintf(speedStr,"%2.0f RPM",spindleSpeed_TurnsSec * 60.0);
   display.println(speedStr);
 
@@ -270,8 +344,23 @@ void UpdateDisplay()
 
 void JogX()
 {
+  // Don't jog if currently setting wire diameter or winding
+  if (mode == wind && (winderStage == initDiameter || winderStage == winding))
+  {
+    if (joggingPos)
+    {
+      wireDia_mm += jog_mm;
+      joggingPos = false;
+    }
+    else if (joggingNeg)
+    {
+      wireDia_mm -= jog_mm;
+      joggingNeg = false;
+    }
+  }
+
   // Add jogging command if there is room. Otherwise try again later.
-  if (joggingPos)
+  else if (joggingPos)
   {
     sprintf(gCodeStr, "$J=X%f F%f", jog_mm, jogFeed_mmSec * 60.0);
     if (SendGCode(gCodeStr)) joggingPos = false;
@@ -287,7 +376,6 @@ void RunLathe()
 {
   if (!running)
   {
-    spindleCmd_Turns = spindleCur_Turns;
     return;
   }
 
@@ -301,11 +389,57 @@ void RunLathe()
       spindleIncr_Turns = spindleIncrNew_Turns;
       spindleCmd_Turns += spindleIncr_Turns;
     }
-    //if (verbose) Serial.println("Lathe: Incr" + String(spindleIncr_Turns));
   }
-  else
+}
+
+void Wind()
+{
+  // Start button advances stage
+  switch (winderStage)
   {
-    //if (verbose) Serial.println("Lathe: " + String(spindleCur_Turns) + ", waiting for " + String(spindleCmd_Turns));
+    case initEndX:
+      sprintf(statusStr, "Jog to end");
+      winderxMax_mm = xCur_mm;
+    break;
+
+    case initStartX:
+      sprintf(statusStr, "Jog to start");
+      winderxMin_mm = xCur_mm;
+    break;
+
+    case initDiameter:
+      xIncr_mm = wireDia_mm;
+      if (winderxMax_mm < winderxMin_mm)
+      {
+        double tempx = winderxMax_mm;
+        winderxMax_mm = winderxMin_mm;
+        winderxMin_mm = tempx;
+        xIncr_mm *= -1.0;
+      }
+
+      sprintf(statusStr, "Set dia: %2.2f mm", wireDia_mm);
+    break;
+
+    case winding:
+      if (running)
+      {
+        if ((dirVal && ((spindleCmd_Turns - spindleCur_Turns) <= spindleIncr_Turns)) || (!dirVal && ((spindleCmd_Turns - spindleCur_Turns) >= spindleIncr_Turns)))
+        {
+          spindleIncrNew_Turns = 1;
+          if (!dirVal) spindleIncrNew_Turns *= -1.0;
+
+          sprintf(gCodeStr, "$J=X%fY%f F%f", xIncr_mm, spindleIncrNew_Turns, spindleSpeed_TurnsSec * 60.0);
+          if (SendGCode(gCodeStr))
+          {
+            spindleIncr_Turns = spindleIncrNew_Turns;
+            spindleCmd_Turns += spindleIncr_Turns;
+            
+            xCmd_mm += xIncr_mm;
+            if (xCmd_mm >= winderxMax_mm || xCmd_mm <= winderxMin_mm) xIncr_mm *= -1;
+          }
+        }
+      }
+    break;
   }
 }
 
@@ -321,7 +455,7 @@ void loop()
     break;
 
     case wind:
-      //TODO
+      Wind();
     break;
   }
 
