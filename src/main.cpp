@@ -1,6 +1,6 @@
 /* TODO:
+- Longer moves for winder
 - Recv buffer freezing? (flush and/or check available)
-- Wind start at end vs start inconsistent
 */
 
 #include <SoftwareSerial.h>
@@ -13,7 +13,7 @@
 
 /////////////////
 // SETTINGS
-#define verbose true                     // Debug output to Serial
+#define verbose false                     // Debug output to Serial
 
 #define jogBase_mm 1.0                    // X jog increment for each press of the button
 #define jogFeed_mmSec 5.0                 // X jog feed rate
@@ -53,8 +53,10 @@ unsigned long lastStatusReq = millis();
 double spindleIncr_Turns = 0;
 double spindleIncrNew_Turns = 0;
 double spindleCmd_Turns = 0;
+double newSpindleCmd_Turns = 0;
 double spindleCur_Turns = 0;
 double xCmd_mm = 0;
+double newXCmd_mm = 0;
 double xCur_mm = 0;
 double xIncr_mm = 0;
 double winderxMin_mm = 0;
@@ -63,11 +65,12 @@ double wireDia_mm = 0;
 
 enum modes 
 {
+  undefined,
   lathe,
   wind
 };
-modes mode = lathe;
-modes modePrev = mode;
+modes mode = undefined;
+modes modePrev = undefined;
 
 enum winderStages
 {
@@ -207,7 +210,7 @@ void setup()
   InitDisplay();
 
   // Initialize GRBL
-  SendGCode("G91");
+  SendGCode("G90"); // Absolute mode by default. Jogs will override with relative.
   SendGCode("G10 L20 P1 Y0"); // Reset spindle work position
   grblSerial.write("~"); // Return to IDLE state
 
@@ -220,6 +223,7 @@ void StartSpindle()
 {
   if (!running)
   {
+    grblSerial.write("~"); // Resume
     if (verbose) Serial.println("Run");
   }
   running = true;
@@ -232,8 +236,8 @@ void StopSpindle()
 {
   if (running)
   {
-    grblSerial.write("!"); // Cancel any existing movements
-    grblSerial.write("~"); // Return to IDLE state
+    grblSerial.write("!"); // Cancel any existing jogs
+    grblSerial.write("~"); // Return to IDLE if jogging
     if (verbose) Serial.println("Stop");
   }
   running = false;
@@ -247,8 +251,14 @@ void GetInputs()
 {
   // Some commands latch true until they are able to be sent to GRBL
 
-  if (!digitalRead(modePin)) mode = lathe;
-  else mode = wind;
+  if (!digitalRead(modePin))
+  {
+    mode = lathe;
+  }
+  else 
+  {
+    mode = wind;
+  }
 
   if (mode != modePrev)
   {
@@ -288,21 +298,42 @@ void GetInputs()
       switch (winderStage)
       {
         case initEndX:
+          winderxMax_mm = xCur_mm;
           winderStage = initStartX;
           break;
 
         case initStartX:
-          winderStage = initDiameter;
-    
-          if (xIncr_mm == 0.0) sprintf(gCodeStr, "G10 L20 P1 X0 Y0"); // Reset  work position
-          else sprintf(gCodeStr, "G10 L20 P1 X%f Y0",winderxMax_mm-winderxMin_mm);
-          SendGCode(gCodeStr);
-          xCmd_mm = 0.0;
+          winderxMin_mm = xCur_mm;
 
+          // Initialize work position
+          if (winderxMax_mm < winderxMin_mm)
+          {
+            double tempx = winderxMax_mm;
+            winderxMax_mm = winderxMin_mm;
+            winderxMin_mm = tempx;
+            xCmd_mm = winderxMax_mm-winderxMin_mm; // At end
+          }
+          else
+          {
+            xCmd_mm = 0.0; // At start
+          }
+          winderxMax_mm -= winderxMin_mm;
+          winderxMin_mm = 0.0;
+          sprintf(gCodeStr, "G10 L20 P1 X%f Y0",xCmd_mm);
+          SendGCode(gCodeStr);
+
+          winderStage = initDiameter;
           break;
 
         case initDiameter:
+          xIncr_mm = wireDia_mm;
+          if (xCmd_mm > 0.0) xIncr_mm *= -1.0;
           winderStage = winding;
+
+          sprintf(tempStr,"Min Max Incr: %f %f %f",winderxMin_mm,winderxMax_mm,xIncr_mm);
+          if (verbose) Serial.println(tempStr);
+
+          StartSpindle();
           break;
 
         case winding:
@@ -349,12 +380,12 @@ void JogX()
   {
     if (joggingPos)
     {
-      wireDia_mm += jog_mm;
+      wireDia_mm += jog_mm * 0.1;
       joggingPos = false;
     }
     else if (joggingNeg)
     {
-      wireDia_mm -= jog_mm;
+      wireDia_mm -= jog_mm * 0.1;
       joggingNeg = false;
     }
   }
@@ -362,12 +393,12 @@ void JogX()
   // Add jogging command if there is room. Otherwise try again later.
   else if (joggingPos)
   {
-    sprintf(gCodeStr, "$J=X%f F%f", jog_mm, jogFeed_mmSec * 60.0);
+    sprintf(gCodeStr, "$J=G91 X%f F%f", jog_mm, jogFeed_mmSec * 60.0);
     if (SendGCode(gCodeStr)) joggingPos = false;
   }
   else if (joggingNeg)
   {
-    sprintf(gCodeStr, "$J=X-%f F%f", jog_mm, jogFeed_mmSec * 60.0);
+    sprintf(gCodeStr, "$J=G91 X-%f F%f", jog_mm, jogFeed_mmSec * 60.0);
     if (SendGCode(gCodeStr)) joggingNeg = false;
   }
 }
@@ -383,7 +414,7 @@ void RunLathe()
   {
     spindleIncrNew_Turns = spindleIncr_ms * spindleSpeed_TurnsSec / 1000.0;
     if (!dirVal) spindleIncrNew_Turns *= -1.0;
-    sprintf(gCodeStr, "$J=Y%f F%f", spindleIncrNew_Turns, spindleSpeed_TurnsSec * 60.0);
+    sprintf(gCodeStr, "$J=G91 Y%f F%f", spindleIncrNew_Turns, spindleSpeed_TurnsSec * 60.0);
     if (SendGCode(gCodeStr))
     {
       spindleIncr_Turns = spindleIncrNew_Turns;
@@ -399,24 +430,13 @@ void Wind()
   {
     case initEndX:
       sprintf(statusStr, "Jog to end");
-      winderxMax_mm = xCur_mm;
     break;
 
     case initStartX:
       sprintf(statusStr, "Jog to start");
-      winderxMin_mm = xCur_mm;
     break;
 
     case initDiameter:
-      xIncr_mm = wireDia_mm;
-      if (winderxMax_mm < winderxMin_mm)
-      {
-        double tempx = winderxMax_mm;
-        winderxMax_mm = winderxMin_mm;
-        winderxMin_mm = tempx;
-        xIncr_mm *= -1.0;
-      }
-
       sprintf(statusStr, "Set dia: %2.2f mm", wireDia_mm);
     break;
 
@@ -428,13 +448,14 @@ void Wind()
           spindleIncrNew_Turns = 1;
           if (!dirVal) spindleIncrNew_Turns *= -1.0;
 
-          sprintf(gCodeStr, "$J=X%fY%f F%f", xIncr_mm, spindleIncrNew_Turns, spindleSpeed_TurnsSec * 60.0);
+          newSpindleCmd_Turns = spindleCmd_Turns + spindleIncr_Turns;
+          newXCmd_mm = xCmd_mm + xIncr_mm;
+          sprintf(gCodeStr, "G1 X%f Y%f F%f", newXCmd_mm, newSpindleCmd_Turns, spindleSpeed_TurnsSec * 60.0);
           if (SendGCode(gCodeStr))
           {
             spindleIncr_Turns = spindleIncrNew_Turns;
-            spindleCmd_Turns += spindleIncr_Turns;
-            
-            xCmd_mm += xIncr_mm;
+            spindleCmd_Turns = newSpindleCmd_Turns;
+            xCmd_mm = newXCmd_mm;
             if (xCmd_mm >= winderxMax_mm || xCmd_mm <= winderxMin_mm) xIncr_mm *= -1;
           }
         }
