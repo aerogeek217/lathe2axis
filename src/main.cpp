@@ -1,5 +1,4 @@
 /* TODO:
-- Longer moves for winder
 - Recv buffer freezing? (flush and/or check available)
 */
 
@@ -62,6 +61,7 @@ double xIncr_mm = 0;
 double winderxMin_mm = 0;
 double winderxMax_mm = 0;
 double wireDia_mm = 0;
+double windTurnsPerPass = 0;
 
 enum modes 
 {
@@ -317,6 +317,7 @@ void GetInputs()
           {
             xCmd_mm = 0.0; // At start
           }
+          spindleCmd_Turns = spindleCur_Turns;
           winderxMax_mm -= winderxMin_mm;
           winderxMin_mm = 0.0;
           sprintf(gCodeStr, "G10 L20 P1 X%f Y0",xCmd_mm);
@@ -326,7 +327,9 @@ void GetInputs()
           break;
 
         case initDiameter:
-          xIncr_mm = wireDia_mm;
+          windTurnsPerPass = round((winderxMax_mm-winderxMin_mm)/wireDia_mm);
+
+          xIncr_mm = wireDia_mm * windTurnsPerPass;
           if (xCmd_mm > 0.0) xIncr_mm *= -1.0;
           winderStage = winding;
 
@@ -445,10 +448,10 @@ void Wind()
       {
         if ((dirVal && ((spindleCmd_Turns - spindleCur_Turns) <= spindleIncr_Turns)) || (!dirVal && ((spindleCmd_Turns - spindleCur_Turns) >= spindleIncr_Turns)))
         {
-          spindleIncrNew_Turns = 1;
+          spindleIncrNew_Turns = windTurnsPerPass;
           if (!dirVal) spindleIncrNew_Turns *= -1.0;
 
-          newSpindleCmd_Turns = spindleCmd_Turns + spindleIncr_Turns;
+          newSpindleCmd_Turns = spindleCmd_Turns + spindleIncrNew_Turns;
           newXCmd_mm = xCmd_mm + xIncr_mm;
           sprintf(gCodeStr, "G1 X%f Y%f F%f", newXCmd_mm, newSpindleCmd_Turns, spindleSpeed_TurnsSec * 60.0);
           if (SendGCode(gCodeStr))
@@ -456,7 +459,8 @@ void Wind()
             spindleIncr_Turns = spindleIncrNew_Turns;
             spindleCmd_Turns = newSpindleCmd_Turns;
             xCmd_mm = newXCmd_mm;
-            if (xCmd_mm >= winderxMax_mm || xCmd_mm <= winderxMin_mm) xIncr_mm *= -1;
+            xIncr_mm *= -1.0;
+            //if (xCmd_mm >= winderxMax_mm || xCmd_mm <= winderxMin_mm) xIncr_mm *= -1;
           }
         }
       }
